@@ -148,6 +148,9 @@ def _build_s2mel_additional_information(
     duration_factor = meta.get("duration_factor", 1.0)
     additional_information["duration_factor"] = 1.0 if duration_factor is None else float(duration_factor)
 
+    target_duration = meta.get("target_duration")
+    additional_information["target_duration"] = None if target_duration is None else float(target_duration)
+
     for key in ("S_ref", "ref_mel", "style"):
         val = meta.get(key)
         if not isinstance(val, torch.Tensor) or val.numel() == 0:
@@ -273,6 +276,12 @@ def talker2s2mel_full_payload(
             "meta.duration_factor",
             "meta",
             "duration_factor",
+        ),
+        "target_duration": _get_payload_value(
+            pooling_output,
+            "meta.target_duration",
+            "meta",
+            "target_duration",
         ),
     }
     additional_information = _build_s2mel_additional_information(

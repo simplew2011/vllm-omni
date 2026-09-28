@@ -474,3 +474,69 @@ def test_v25_default_emotion_reuses_speaker_w2v_features(monkeypatch):
         "emo": speaker_features,
         "alpha": 1.0,
     }
+
+
+def test_make_omni_output_carries_target_duration():
+    talker = object.__new__(IndexTTS2TalkerForConditionalGeneration)
+    talker.use_gpt_latent = False
+
+    result = talker.make_omni_output(
+        torch.zeros(1, 8),
+        model_intermediate_buffer=[
+            {
+                "meta": {
+                    "mel_code_count": 1,
+                    "duration_factor": 1.0,
+                    "target_duration": 3.5,
+                }
+            }
+        ],
+    )
+
+    assert result.multimodal_outputs["meta"][0]["target_duration"] == 3.5
+    assert result.multimodal_outputs["meta"][0]["duration_factor"] == 1.0
+
+
+def test_make_omni_output_omits_target_duration_on_decode_steps():
+    talker = object.__new__(IndexTTS2TalkerForConditionalGeneration)
+    talker.use_gpt_latent = False
+
+    result = talker.make_omni_output(
+        torch.zeros(1, 8),
+        model_intermediate_buffer=[
+            {"meta": {"mel_code_count": 2, "target_duration": 3.5}}
+        ],
+    )
+
+    assert "target_duration" not in result.multimodal_outputs["meta"][0]
+
+
+def test_v25_preprocessed_text_is_identical_in_prompt_sizing_and_talker(monkeypatch):
+    from vllm_omni.model_executor.models.indextts2 import prompt_utils, text_processing_v2_5
+
+    encoded_inputs = []
+
+    def fail_normalization(*args, **kwargs):
+        raise AssertionError("Preprocessed segments must not be normalized again")
+
+    def encode(text, **kwargs):
+        encoded_inputs.append(text)
+        return [58838, 42, 43]
+
+    monkeypatch.setattr(text_processing_v2_5, "normalize_indextts25_text", fail_normalization)
+    monkeypatch.setattr(text_processing_v2_5, "encode_indextts25_text", encode)
+    talker = object.__new__(IndexTTS2TalkerForConditionalGeneration)
+    talker.conditioning_policy = resolve_indextts_conditioning_policy("indextts2_5")
+    talker.model_path = "/model"
+    talker.config = SimpleNamespace(tokenizer_file="tokenizer.tiktoken")
+    text = "<|SPECIAL_TOKEN_2|>XING2<|SPECIAL_TOKEN_2|>"
+
+    prompt_len = prompt_utils.estimate_indextts2_prefill_prompt_len(
+        "/model", text, model_type="indextts2_5", lang="zh", text_preprocessed=True
+    )
+    token_ids, language_id = talker._tokenize_text(text, torch.device("cpu"), lang="zh", text_preprocessed=True)
+
+    assert encoded_inputs == ["<|zh|> " + text] * 2
+    assert prompt_len == token_ids.shape[1] + 3 + 1
+    assert language_id is not None
+    assert language_id.tolist() == [1]

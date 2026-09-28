@@ -297,3 +297,45 @@ def test_talker2s2mel_full_payload_missing_required_fields_raises():
         talker2s2mel_full_payload(None, {"hidden_states.latent": torch.randn(1, LATENT_DIM)}, None)
     with pytest.raises(ValueError, match="missing meta.use_gpt_latent"):
         talker2s2mel_full_payload(None, {"codes.mel": torch.tensor([[1]])}, None)
+
+
+def test_build_s2mel_payload_forwards_target_duration():
+    from vllm_omni.model_executor.stage_input_processors.indextts2 import (
+        _build_s2mel_additional_information,
+    )
+
+    info = _build_s2mel_additional_information(
+        torch.tensor([1, 2, 3]),
+        None,
+        {
+            "duration_factor": 1.0,
+            "target_duration": 6.5,
+            "S_ref": torch.zeros(1, 2, 4),
+            "ref_mel": torch.zeros(1, 2, 4),
+            "style": torch.zeros(1, 4),
+        },
+        use_gpt_latent=False,
+        context="test",
+    )
+    assert info["target_duration"] == 6.5
+    assert info["duration_factor"] == 1.0
+
+
+def test_build_s2mel_payload_target_duration_defaults_to_none():
+    from vllm_omni.model_executor.stage_input_processors.indextts2 import (
+        _build_s2mel_additional_information,
+    )
+
+    info = _build_s2mel_additional_information(
+        torch.tensor([1, 2, 3]),
+        None,
+        {
+            "duration_factor": 1.0,
+            "S_ref": torch.zeros(1, 2, 4),
+            "ref_mel": torch.zeros(1, 2, 4),
+            "style": torch.zeros(1, 4),
+        },
+        use_gpt_latent=False,
+        context="test",
+    )
+    assert info["target_duration"] is None

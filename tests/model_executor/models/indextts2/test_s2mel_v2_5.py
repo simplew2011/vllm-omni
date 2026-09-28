@@ -1074,3 +1074,40 @@ def test_v25_default_recipe_selects_validated_triton_backend_for_stage0():
     assert stage0["attention_backend"] == "TRITON_ATTN"
     assert stage0["enable_chunked_prefill"] is False
     assert stage0["max_num_batched_tokens"] == stage0["max_model_len"]
+
+
+def test_target_lengths_prefers_target_duration():
+    lengths = IndexTTS2S2MelDecoder._target_lengths(
+        [10, 20],
+        semantic_time_scale=1,
+        mel_code_to_frame_ratio=1.72,
+        duration_factors=[1.0, 1.0],
+        target_durations=[2.0, None],
+        sampling_rate=22050,
+        hop_length=256,
+    )
+    assert lengths[0] == round(2.0 * 22050 / 256)
+    assert lengths[1] == int(20 * 1.0 * 1.72 * 1.0)
+
+
+def test_target_lengths_default_unchanged():
+    lengths = IndexTTS2S2MelDecoder._target_lengths(
+        [10],
+        semantic_time_scale=1,
+        mel_code_to_frame_ratio=1.72,
+        duration_factors=[1.5],
+    )
+    assert lengths == [int(10 * 1.0 * 1.72 * 1.5)]
+
+
+def test_target_lengths_rejects_batch_mismatch():
+    import pytest
+
+    with pytest.raises(ValueError, match="batch mismatch"):
+        IndexTTS2S2MelDecoder._target_lengths(
+            [10],
+            semantic_time_scale=1,
+            mel_code_to_frame_ratio=1.72,
+            duration_factors=[1.0],
+            target_durations=[1.0, 2.0],
+        )

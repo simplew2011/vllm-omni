@@ -31,6 +31,7 @@ from .configuration_indextts2 import (
     INDEXTTS25_MIN_DURATION_FACTOR,
     IndexTTS2Config,
 )
+from .duration_control import fit_waveform_length, normalize_target_duration
 from .preprocess_utils import (
     load_semantic_codec,
     resolve_model_directory,
@@ -213,6 +214,13 @@ class IndexTTS2S2MelDecoder(nn.Module):
         for key in ["DiT", "wavenet", "length_regulator", "style_encoder", "preprocess_params"]:
             if key in s2mel_args and isinstance(s2mel_args[key], dict):
                 s2mel_args[key] = AttrDict(s2mel_args[key])
+
+        # Audio frame geometry for exact target-duration control. ``spect_params``
+        # stays a plain dict, so read it via item access.
+        _preprocess_params = s2mel_args["preprocess_params"]
+        _spect_params = _preprocess_params.get("spect_params", {})
+        self.s2mel_sampling_rate = int(_preprocess_params.get("sr", 22050))
+        self.s2mel_hop_length = int(_spect_params.get("hop_length", 256))
 
         self.s2mel = MyModel(
             s2mel_args,
@@ -406,6 +414,9 @@ class IndexTTS2S2MelDecoder(nn.Module):
                     code_lens_list.append(mel_codes.shape[1])
             code_lens = torch.tensor(code_lens_list, device=device, dtype=torch.long)
         duration_factors = self._duration_factors(request_infos, len(code_lens_list))
+        target_durations = self._target_durations(request_infos, len(code_lens_list))
+        sampling_rate = self.s2mel_sampling_rate
+        hop_length = self.s2mel_hop_length
 
         # Trim to actual length
         max_len = max(code_lens_list)
@@ -468,6 +479,9 @@ class IndexTTS2S2MelDecoder(nn.Module):
             semantic_time_scale=semantic_time_scale,
             mel_code_to_frame_ratio=self.mel_code_to_frame_ratio,
             duration_factors=duration_factors,
+            target_durations=target_durations,
+            sampling_rate=sampling_rate,
+            hop_length=hop_length,
         )
         target_lengths = torch.tensor(target_lengths_list, device=device, dtype=torch.long)
         if logger.isEnabledFor(logging.DEBUG):
@@ -608,6 +622,18 @@ class IndexTTS2S2MelDecoder(nn.Module):
             )
         wav: torch.Tensor | list[torch.Tensor] = wavs[0] if len(wavs) == 1 else wavs
 
+        if any(duration is not None for duration in target_durations):
+            wav_is_list = isinstance(wav, list)
+            wav_items = wav if wav_is_list else [wav]
+            wav_items = [
+                fit_waveform_length(
+                    item,
+                    round(duration * sampling_rate) if duration is not None else None,
+                )
+                for item, duration in zip(wav_items, target_durations)
+            ]
+            wav = wav_items if wav_is_list else wav_items[0]
+
         # Keep the public vLLM-Omni audio contract as normalized float. This is
         # numerically equivalent to official infer_v2.py before its int16 save
         # step, while avoiding double scaling in OpenAI/soundfile encoders.
@@ -677,17 +703,41 @@ class IndexTTS2S2MelDecoder(nn.Module):
         return factors
 
     @staticmethod
+    def _target_durations(infos: list[dict[str, Any]], batch_size: int) -> list[float | None]:
+        if not infos:
+            return [None] * batch_size
+        durations = [normalize_target_duration(info.get("target_duration")) for info in infos]
+        if len(durations) != batch_size:
+            raise ValueError(f"IndexTTS target-duration batch mismatch: durations={len(durations)} batch={batch_size}")
+        return durations
+
+    @staticmethod
     def _target_lengths(
         code_lens: list[int],
         *,
         semantic_time_scale: int,
         mel_code_to_frame_ratio: float,
         duration_factors: list[float],
+        target_durations: list[float | None] | None = None,
+        sampling_rate: int = 22050,
+        hop_length: int = 256,
     ) -> list[int]:
         if len(code_lens) != len(duration_factors):
             raise ValueError(
                 f"IndexTTS target-length batch mismatch: codes={len(code_lens)} factors={len(duration_factors)}"
             )
+        if target_durations is not None:
+            if len(target_durations) != len(code_lens):
+                raise ValueError(
+                    "IndexTTS target-duration/target-length batch mismatch: "
+                    f"durations={len(target_durations)} codes={len(code_lens)}"
+                )
+            return [
+                max(1, round(duration * sampling_rate / hop_length))
+                if duration is not None
+                else int(length * semantic_time_scale * mel_code_to_frame_ratio * factor)
+                for length, factor, duration in zip(code_lens, duration_factors, target_durations)
+            ]
         return [
             int(length * semantic_time_scale * mel_code_to_frame_ratio * factor)
             for length, factor in zip(code_lens, duration_factors)

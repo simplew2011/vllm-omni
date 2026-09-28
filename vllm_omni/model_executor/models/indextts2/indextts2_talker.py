@@ -42,8 +42,10 @@ from vllm_omni.utils.speaker_cache import get_speaker_cache
 from .configuration_indextts2 import (
     INDEXTTS25_MAX_DURATION_FACTOR,
     INDEXTTS25_MIN_DURATION_FACTOR,
+    INDEXTTS25_TEXT_PREPROCESSED_KEY,
     IndexTTS2Config,
 )
+from .duration_control import normalize_target_duration
 from .gpt.conformer_encoder import ConformerEncoder
 from .gpt.embeddings import LearnedPositionEmbeddings
 from .gpt.perceiver import PerceiverResampler
@@ -456,6 +458,9 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
                 ref_mel = info_meta.get("ref_mel")
                 style = info_meta.get("style")
                 req_meta["duration_factor"] = info_meta.get("duration_factor", 1.0)
+                target_duration = info_meta.get("target_duration")
+                if target_duration is not None:
+                    req_meta["target_duration"] = float(target_duration)
                 if isinstance(s_ref, torch.Tensor):
                     req_meta["S_ref"] = s_ref
                 if isinstance(ref_mel, torch.Tensor):
@@ -567,6 +572,10 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         # model-side guard as the final fail-fast validation layer.
         if not (INDEXTTS25_MIN_DURATION_FACTOR <= duration_factor <= INDEXTTS25_MAX_DURATION_FACTOR):
             raise ValueError("IndexTTS 2.5 duration_factor must be between 0.5 and 2.0")
+        target_duration_raw = _first("target_duration")
+        target_duration = (
+            normalize_target_duration(target_duration_raw) if target_duration_raw is not None else None
+        )
 
         text = _first("text")
         if not text:
@@ -584,6 +593,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         use_random = bool(_first("use_random", False))
         lang = str(_first("lang", "zh"))
         text_normalization = bool(_first("text_normalization", True))
+        text_preprocessed = bool(_first(INDEXTTS25_TEXT_PREPROCESSED_KEY, False))
         _raw_emo_voice = _first("emo_voice_name")
         emo_voice_name = str(_raw_emo_voice).strip().lower() if _raw_emo_voice else None
 
@@ -706,6 +716,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             device,
             lang=lang,
             text_normalization=text_normalization,
+            text_preprocessed=text_preprocessed,
         )
         text_emb = self.text_embedding(text_tokens) + self.text_pos_embedding(text_tokens)
         if lang_id is not None:
@@ -738,6 +749,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
                 "style": style.cpu().contiguous(),
                 "use_gpt_latent": self.use_gpt_latent,
                 "duration_factor": duration_factor,
+                "target_duration": target_duration,
             },
             "codes": {"mel": torch.zeros(0, dtype=torch.long, device=device)},
         }
@@ -1063,6 +1075,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         *,
         lang: str = "zh",
         text_normalization: bool = True,
+        text_preprocessed: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Tokenize text and add the checkpoint start/stop text tokens."""
         start_text = 0
@@ -1077,6 +1090,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
                 model_dir=self.model_path,
                 tokenizer_file=self.config.tokenizer_file,
                 text_normalization=text_normalization,
+                text_preprocessed=text_preprocessed,
             )
             token_ids = [token_id for token_id in token_ids if token_id not in {start_text, stop_text}]
         else:

@@ -780,3 +780,150 @@ def test_qwen3_validate_rejects_no_voice_no_default_then_accepts():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_indextts25_accepts_target_duration(mocker):
+    adapter = IndexTTS25Adapter(SpeechServingContext(server=mocker.Mock()))
+
+    assert adapter._validate_extra_params({"target_duration": 5.0}) is None
+    assert adapter._validate_extra_params({}) is None
+    for bad in (0, -1, True, "x", float("nan")):
+        error = adapter._validate_extra_params({"target_duration": bad})
+        assert error is not None and "target_duration" in error
+
+
+def test_indextts25_build_params_emits_target_duration(mocker):
+    adapter = IndexTTS25Adapter(SpeechServingContext(server=mocker.Mock()))
+    mocker.patch.object(
+        IndexTTS2Adapter,
+        "_build_params",
+        new=mocker.AsyncMock(return_value={"text": ["hi"]}),
+    )
+
+    request = OpenAICreateSpeechRequest(
+        input="hi",
+        speed=1.0,
+        extra_params={"target_duration": 4.25},
+    )
+    params = asyncio.run(adapter._build_params(request))
+    assert params["target_duration"] == [4.25]
+    # speed still maps to duration_factor; target takes precedence downstream.
+    assert params["duration_factor"] == [1.0]
+
+
+def test_indextts25_build_params_omits_absent_target_duration(mocker):
+    adapter = IndexTTS25Adapter(SpeechServingContext(server=mocker.Mock()))
+    mocker.patch.object(
+        IndexTTS2Adapter,
+        "_build_params",
+        new=mocker.AsyncMock(return_value={"text": ["hi"]}),
+    )
+
+    request = OpenAICreateSpeechRequest(input="hi", speed=1.0)
+    params = asyncio.run(adapter._build_params(request))
+    assert "target_duration" not in params
+
+
+@pytest.mark.parametrize("normalized, expected", [("ONE.TWO.THREE.", ["ONE.", "TWO.", "THREE."]), ("ONE.", ["ONE."])])
+def test_indextts25_segments_normalize_once_and_preserve_conditioning(monkeypatch, mocker, normalized, expected):
+    from vllm_omni.model_executor.models.indextts2 import text_processing_v2_5, tokenizer_v2_5
+    from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import IndexTTS25Config
+
+    calls = []
+    voice = [[0.1, 0.2], 22050]
+    shared_params = {
+        "text": ["original"],
+        "lang": ["en"],
+        "text_normalization": [True],
+        "voice": [voice],
+        "duration_factor": [0.5],
+        "emo_alpha": [0.8],
+    }
+
+    async def build_params(request):
+        calls.append("resolve_reference")
+        return shared_params
+
+    def normalize(text, *, lang, text_normalization):
+        assert text == "original"
+        assert lang == "en"
+        assert text_normalization is True
+        calls.append("normalize")
+        return normalized
+
+    def encode(text, *, model_dir, tokenizer_file):
+        assert model_dir == "/model"
+        assert tokenizer_file == "custom.tiktoken"
+        return [ord(char) + 2 for char in text]
+
+    monkeypatch.setattr(text_processing_v2_5, "normalize_indextts25_text", normalize)
+    monkeypatch.setattr(text_processing_v2_5, "encode_indextts25_text", encode)
+    monkeypatch.setattr(tokenizer_v2_5, "encode_indextts25_text", encode)
+    server = mocker.Mock()
+    server.engine_client.model_config.model = "/model"
+    server.engine_client.model_config.hf_config = IndexTTS25Config(
+        tokenizer_file="custom.tiktoken", gpt={"max_text_tokens": 13}
+    )
+    adapter = IndexTTS25Adapter(SpeechServingContext(server=server))
+    monkeypatch.setattr(adapter, "_build_params", build_params)
+    request = OpenAICreateSpeechRequest(input="original")
+
+    prepared = asyncio.run(adapter.build_segments(request))
+
+    assert calls == ["resolve_reference", "normalize"]
+    assert [item.tts_params["text"][0] for item in prepared] == expected
+    assert len({item.prompt["cache_salt"] for item in prepared}) == len(expected)
+    for item in prepared:
+        params = item.tts_params
+        assert params is not shared_params
+        assert params["voice"] is shared_params["voice"]
+        assert params["duration_factor"] == [0.5]
+        assert params["emo_alpha"] == [0.8]
+        assert params["_indextts25_text_preprocessed"] == [True]
+        assert item.prompt["additional_information"] is params
+        # Language-prefixed text + 2 wrappers + 3 conditioning + 1 start-mel.
+        assert len(item.prompt["prompt_token_ids"]) == len("<|en|> " + params["text"][0]) + 6
+    assert shared_params["text"] == ["original"]
+    assert "_indextts25_text_preprocessed" not in shared_params
+
+
+def test_indextts25_preprocessing_mode_changes_cache_salt():
+    request = OpenAICreateSpeechRequest(input="hello")
+    params = {"text": ["hello"]}
+    assert indextts2_conditioning_cache_salt(request, params) != indextts2_conditioning_cache_salt(
+        request, dict(params, _indextts25_text_preprocessed=[True])
+    )
+
+
+@pytest.mark.parametrize("mode", ["stream", "timestamps", "plain"])
+def test_indextts25_long_request_response_scope(mocker, mode):
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+    from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
+
+    adapter = IndexTTS25Adapter(SpeechServingContext(server=mocker.Mock()))
+    mocker.patch.object(
+        adapter,
+        "build_segments",
+        new=mocker.AsyncMock(
+            return_value=[
+                PreparedRequest(prompt={"part": 0}),
+                PreparedRequest(prompt={"part": 1}),
+            ]
+        ),
+    )
+    request = OpenAICreateSpeechRequest(input="text", stream=mode == "stream", word_timestamps=mode == "timestamps")
+    if mode == "plain":
+        prepared = asyncio.run(adapter.build(request, [], False))
+        assert prepared.additional_prompts == [{"part": 1}]
+    else:
+        with pytest.raises(ValueError, match="non-streaming"):
+            asyncio.run(adapter.build(request, [], False))
+
+
+def test_prepared_request_has_segment_fields():
+    from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
+
+    prepared = PreparedRequest(prompt={"a": 1})
+    assert prepared.additional_prompts == []
+    assert prepared.segment_silence_ms == 200
+    assert prepared.target_duration is None

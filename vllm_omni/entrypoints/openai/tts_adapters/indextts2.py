@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import math
 from collections.abc import Mapping
@@ -18,6 +19,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, Prepare
 from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
     INDEXTTS25_MAX_DURATION_FACTOR,
     INDEXTTS25_MIN_DURATION_FACTOR,
+    INDEXTTS25_TEXT_PREPROCESSED_KEY,
 )
 
 if TYPE_CHECKING:
@@ -108,6 +110,7 @@ def indextts2_conditioning_cache_salt(
         "use_random",
         "lang",
         "text_normalization",
+        INDEXTTS25_TEXT_PREPROCESSED_KEY,
         "ref_audio_cache_key",
         "emo_audio_cache_key",
     ):
@@ -288,6 +291,112 @@ class IndexTTS25Adapter(IndexTTS2Adapter):
     name = "indextts2_5"
     native_speed_control: ClassVar[bool] = True
 
+    async def build(
+        self,
+        request: OpenAICreateSpeechRequest,
+        sampling_params_list: list,
+        has_inline_ref_audio: bool,
+    ) -> PreparedRequest:
+        segments = await self.build_segments(request)
+        prepared = segments[0]
+        if len(segments) > 1:
+            if request.is_streaming() or request.word_timestamps:
+                raise ValueError(
+                    "IndexTTS 2.5 long text currently requires non-streaming audio without word timestamps"
+                )
+            prepared.additional_prompts = [segment.prompt for segment in segments[1:]]
+        return prepared
+
+    async def build_segments(self, request: OpenAICreateSpeechRequest) -> list[PreparedRequest]:
+        """Prepare ordered segments for a caller that collects every result.
+
+        Reference audio is resolved once. Text normalization, tokenizer file
+        resolution, and segmentation run off the serving event loop.
+        """
+        params = await self._build_params(request)
+        # Emotion inference defaults to the whole input, as it did before
+        # segmentation. Explicit emotion text keeps its existing meaning.
+        if (
+            _first_conditioning_value(params.get("use_emo_text"))
+            and _first_conditioning_value(params.get("emo_text")) is None
+        ):
+            params["emo_text"] = [request.input]
+        return await asyncio.to_thread(self._prepare_segments, request, params)
+
+    def _prepare_segments(self, request: OpenAICreateSpeechRequest, params: dict[str, Any]) -> list[PreparedRequest]:
+        from vllm_omni.model_executor.models.indextts2.duration_control import (
+            allocate_target_frames,
+        )
+        from vllm_omni.model_executor.models.indextts2.prompt_utils import (
+            estimate_indextts2_prefill_prompt_len,
+        )
+        from vllm_omni.model_executor.models.indextts2.text_processing_v2_5 import (
+            normalize_indextts25_text,
+            split_indextts25_text,
+        )
+        from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
+            INDEXTTS25_TOKENIZER_FILE,
+            encode_indextts25_text,
+        )
+
+        model_config = self.ctx.server.engine_client.model_config
+        hf_config = model_config.hf_config
+        tokenizer_file = getattr(hf_config, "tokenizer_file", INDEXTTS25_TOKENIZER_FILE)
+        lang = str(_first_conditioning_value(params["lang"]))
+        text = normalize_indextts25_text(
+            request.input,
+            lang=lang,
+            text_normalization=bool(_first_conditioning_value(params["text_normalization"])),
+        )
+
+        def token_length(value: str) -> int:
+            return len(encode_indextts25_text(value, model_dir=model_config.model, tokenizer_file=tokenizer_file))
+
+        segments = split_indextts25_text(
+            text,
+            token_length=token_length,
+            lang_prefix=f"<|{lang}|> ",
+            capacity=int(hf_config.gpt["max_text_tokens"]) + 2,
+        )
+
+        # When a single total duration is requested for a long input, distribute
+        # it across segments by token weight (see allocate_target_frames).
+        total_target = _first_conditioning_value(params.get("target_duration"))
+        segment_targets: list[float | None] = [None] * len(segments)
+        if total_target is not None and len(segments) > 1:
+            frames, _ = allocate_target_frames(
+                total_target,
+                [token_length(segment) for segment in segments],
+                sampling_rate=22050,
+                hop_length=256,
+                interval_silence_ms=200,
+            )
+            segment_targets = [frame * 256 / 22050 for frame in frames]
+
+        prepared_segments = []
+        for index, segment in enumerate(segments):
+            segment_params = dict(params)
+            segment_params["text"] = [segment]
+            segment_params[INDEXTTS25_TEXT_PREPROCESSED_KEY] = [True]
+            if segment_targets[index] is not None:
+                segment_params["target_duration"] = [segment_targets[index]]
+            prompt_len = estimate_indextts2_prefill_prompt_len(
+                model_config.model,
+                segment,
+                model_type=self.name,
+                lang=lang,
+                tokenizer_file=tokenizer_file,
+                text_preprocessed=True,
+            )
+            prompt = tokens_input(prompt_token_ids=[1] * prompt_len)
+            prompt["additional_information"] = segment_params
+            prompt["cache_salt"] = indextts2_conditioning_cache_salt(request, segment_params)
+            prepared = PreparedRequest(prompt=prompt, tts_params=segment_params, model_type=self.name)
+            prepared_segments.append(prepared)
+        if total_target is not None and len(prepared_segments) > 1:
+            prepared_segments[0].target_duration = total_target
+        return prepared_segments
+
     def validate(self, request: OpenAICreateSpeechRequest) -> str | None:
         error = super().validate(request)
         if error is not None:
@@ -319,6 +428,15 @@ class IndexTTS25Adapter(IndexTTS2Adapter):
             bool,
         ):
             return "extra_params.text_normalization must be a boolean"
+        if "target_duration" in extras:
+            from vllm_omni.model_executor.models.indextts2.duration_control import (
+                normalize_target_duration,
+            )
+
+            try:
+                normalize_target_duration(extras["target_duration"])
+            except ValueError as exc:
+                return f"extra_params.target_duration {exc}"
         return None
 
     async def _build_params(
@@ -335,4 +453,10 @@ class IndexTTS25Adapter(IndexTTS2Adapter):
         params["text_normalization"] = [bool(extras.get("text_normalization", True))]
         speed = request.speed if request.speed is not None else 1.0
         params["duration_factor"] = [1.0 / speed]
+        if "target_duration" in extras:
+            from vllm_omni.model_executor.models.indextts2.duration_control import (
+                normalize_target_duration,
+            )
+
+            params["target_duration"] = [normalize_target_duration(extras["target_duration"])]
         return params

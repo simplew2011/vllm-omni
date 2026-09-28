@@ -1964,6 +1964,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # in place. The builders need to know whether the caller supplied audio
         # inline vs. via an uploaded voice.
         model_type: str | None = None
+        additional_prompts: list = []
+        segment_silence_ms = 200
+        segment_target_duration: float | None = None
         has_inline_ref_audio = (request.ref_audio is not None) if has_inline_ref_audio is None else has_inline_ref_audio
         if (adapter := self._get_tts_adapter()) is not None:
             validation_error = adapter.validate(request)
@@ -1975,6 +1978,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             model_type = prepared.model_type
             qwen3_ref_audio_warmup_artifact_key = prepared.warmup_artifact_key
             output_policy = prepared.output_policy
+            additional_prompts = prepared.additional_prompts
+            segment_silence_ms = prepared.segment_silence_ms
+            segment_target_duration = prepared.target_duration
         else:
             # Qwen omni models (Qwen3-Omni, Qwen2.5-Omni) use a "talker"
             # stage whose preprocess requires chat-templated tokens.  The
@@ -2061,13 +2067,29 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     if isinstance(sp, SamplingParams):
                         sp.output_kind = RequestOutputKind.CUMULATIVE
 
-        generator = self.engine_client.generate(
-            prompt=prompt,
-            request_id=request_id,
-            sampling_params_list=sampling_params_list,
-            output_modalities=output_modalities,
-            arrival_time=arrival_time,
-        )
+        if additional_prompts:
+            from vllm_omni.entrypoints.openai.speech_segments import generate_speech_segments
+
+            if request.is_streaming() or request.word_timestamps:
+                raise ValueError("Segmented speech requires non-streaming audio without word timestamps")
+            generator = generate_speech_segments(
+                self.engine_client,
+                prompts=[prompt, *additional_prompts],
+                request_id=request_id,
+                sampling_params_list=sampling_params_list,
+                silence_ms=segment_silence_ms,
+                extract_audio=self._extract_audio_output,
+                arrival_time=arrival_time,
+                target_duration=segment_target_duration,
+            )
+        else:
+            generator = self.engine_client.generate(
+                prompt=prompt,
+                request_id=request_id,
+                sampling_params_list=sampling_params_list,
+                output_modalities=output_modalities,
+                arrival_time=arrival_time,
+            )
         self._track_ref_audio_artifact_warmup(
             request_id,
             qwen3_ref_audio_warmup_artifact_key,
